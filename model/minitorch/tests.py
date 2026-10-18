@@ -1,4 +1,4 @@
-"""minitorch 的測試：數值梯度檢查、與手寫版 nn.py 對照、Module / 優化器 / DataLoader 行為。"""
+"""minitorch 的測試：數值梯度檢查、Module / 優化器 / DataLoader 行為、擴散模型。"""
 
 import os
 import sys
@@ -7,7 +7,7 @@ import traceback
 import numpy as np
 
 import minitorch as mt
-from minitorch import common, diffusion, functional as F, layers, models, nn, optim
+from minitorch import diffusion, functional as F, layers, models, optim
 from minitorch.data import DataLoader, TensorDataset, pad_collate
 
 rng = np.random.default_rng(0)
@@ -133,69 +133,33 @@ def engine_semantics():
     assert abs(v.grad[0] - 1.0001 ** 3000) < 1e-6
 
 
-# ───────── 2. 與手寫版 nn.py 對照 ─────────
+# ───────── 2. 分類模型 ─────────
 
-def copy_mlp(hand, auto):
-    for i in range(hand.num_layers):
-        auto.net[1 + 2 * i].weight.data[...] = hand.parameters[f'w{i}']
-        auto.net[1 + 2 * i].bias.data[...] = hand.parameters[f'b{i}']
+@test
+def classifier_models_numeric_gradients():
+    """MLP、CNN 的所有參數都做數值梯度檢查。"""
+    mt.manual_seed(0)
+    for model, x in [(models.MLP(hidden_sizes=(8,)), rng.random((3, 1, 28, 28))),
+                     (models.CNN(channels1=2, channels2=3), rng.random((2, 1, 28, 28)))]:
+        for p in model.parameters():
+            p.data += rng.normal(0, 0.05, p.shape)
+        labels = rng.integers(0, 10, len(x))
+        mt.gradcheck(lambda *ps: F.cross_entropy(model(x), labels), model.parameters(), tol=1e-6, max_checks=5)
+        assert model.predict(x).shape == (len(x),) and 0 <= model.accuracy(x, labels) <= 1
 
 
 @test
-def mlp_matches_handwritten():
-    hand, auto = nn.MLP(hidden_sizes=(16, 8)), models.MLP(hidden_sizes=(16, 8))
-    copy_mlp(hand, auto)
-    x, y = rng.random((5, 1, 28, 28)), rng.integers(0, 10, 5)
-    loss_hand, grads = hand.loss_and_gradients(x, y)
-    loss = F.cross_entropy(auto(x), y)
-    loss.backward()
-    assert abs(loss.item() - loss_hand) < 1e-9
-    for i in range(hand.num_layers):
-        assert np.allclose(auto.net[1 + 2 * i].weight.grad, grads[f'w{i}'], atol=1e-9)
-        assert np.allclose(auto.net[1 + 2 * i].bias.grad, grads[f'b{i}'], atol=1e-9)
-
-
-@test
-def cnn_matches_handwritten():
-    hand, auto = nn.CNN(channels1=3, channels2=4), models.CNN(channels1=3, channels2=4)
-    for name, layer in [('conv1', auto.conv1), ('conv2', auto.conv2), ('fc', auto.fc)]:
-        layer.weight.data[...] = hand.parameters[f'{name}_w']
-        layer.bias.data[...] = hand.parameters[f'{name}_b']
-    x, y = rng.random((3, 1, 28, 28)), rng.integers(0, 10, 3)
-    loss_hand, grads = hand.loss_and_gradients(x, y)
-    loss = F.cross_entropy(auto(x), y)
-    loss.backward()
-    assert abs(loss.item() - loss_hand) < 1e-9
-    for name, layer in [('conv1', auto.conv1), ('conv2', auto.conv2), ('fc', auto.fc)]:
-        assert np.allclose(layer.weight.grad, grads[f'{name}_w'], atol=1e-9), name
-        assert np.allclose(layer.bias.grad, grads[f'{name}_b'], atol=1e-9), name
-
-
-@test
-def gru_matches_handwritten():
-    hand = nn.GRU(12, 16, width=6)
-    for k in hand.parameters:
-        hand.parameters[k] += rng.normal(0, 0.1, hand.parameters[k].shape)
-    auto = models.GRULanguageModel(12, 16, width=6)
-    p, cell = hand.parameters, auto.gru.cell
-    auto.wte.weight.data[...] = p['wte']
-    auto.lm_head.weight.data[...] = p['lm_head']
-    cell.w_x.data[...] = np.concatenate([p['wz'], p['wr'], p['wn']], axis=1)
-    cell.w_h.data[...] = np.concatenate([p['uz'], p['ur']], axis=1)
-    cell.u_n.data[...] = p['un']
-    cell.bias.data[...] = np.concatenate([p['bz'], p['br'], p['bn']])
-    tokens, targets = np.array([11, 1, 2, 3, 2, 4]), np.array([1, 2, 3, 2, 4, 11])
-    loss_hand, grads = hand.loss_and_gradients(tokens, targets)
-    loss = F.cross_entropy(auto(tokens), targets)
-    loss.backward()
-    assert abs(loss.item() - loss_hand) < 1e-9
-    H = 6
-    assert np.allclose(cell.w_x.grad, np.concatenate([grads['wz'], grads['wr'], grads['wn']], axis=1), atol=1e-9)
-    assert np.allclose(cell.w_h.grad, np.concatenate([grads['uz'], grads['ur']], axis=1), atol=1e-9)
-    assert np.allclose(cell.u_n.grad, grads['un'], atol=1e-9)
-    assert np.allclose(cell.bias.grad, np.concatenate([grads['bz'], grads['br'], grads['bn']]), atol=1e-9)
-    assert np.allclose(auto.wte.weight.grad, grads['wte'], atol=1e-9)
-    assert np.allclose(auto.lm_head.weight.grad, grads['lm_head'], atol=1e-9)
+def adam_matches_formula():
+    param = mt.Parameter(rng.normal(size=(3, 2)))
+    expected, m, v = param.data.copy(), 0, 0
+    opt = optim.Adam([param], lr=0.01, betas=(0.9, 0.99))
+    for step in range(1, 6):
+        grad = rng.normal(size=expected.shape)
+        param.grad = grad.copy()
+        opt.step()
+        m, v = 0.9 * m + 0.1 * grad, 0.99 * v + 0.01 * grad ** 2
+        expected = expected - 0.01 * (m / (1 - 0.9 ** step)) / (np.sqrt(v / (1 - 0.99 ** step)) + 1e-8)
+    assert np.allclose(param.data, expected, atol=1e-12)
 
 
 # ───────── 3. Module 系統 ─────────
@@ -291,22 +255,6 @@ def optimizers_converge():
         for _ in range(300):
             opt.zero_grad(); quadratic_loss(p).backward(); opt.step()
         assert np.allclose(p.data, [3, -2], atol=1e-2), (make, p.data)
-
-
-@test
-def adam_matches_handwritten_adam():
-    shapes = {'a': (3, 4), 'b': (4,)}
-    old_params = {k: rng.normal(size=s) for k, s in shapes.items()}
-    new_params = {k: mt.Parameter(v.copy()) for k, v in old_params.items()}
-    old, new = common.Adam(old_params), optim.Adam(list(new_params.values()), lr=0.02, betas=(0.9, 0.99))
-    for _ in range(10):
-        grads = {k: rng.normal(size=s) for k, s in shapes.items()}
-        old.step(grads, 0.02)
-        for k in shapes:
-            new_params[k].grad = grads[k].copy()
-        new.step()
-    for k in shapes:
-        assert np.allclose(old_params[k], new_params[k].data, atol=1e-12)
 
 
 @test

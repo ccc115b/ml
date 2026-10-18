@@ -1,9 +1,11 @@
-"""使用 NumPy tensor 版 nn 訓練字元級 GPT；請由範例庫載入。"""
+"""minitorch：以自動微分訓練字元級 GPT（多層、多頭、LayerNorm、GELU），並生成句子。"""
 
 import random
-from minitorch import common, data, nn
+import minitorch as mt
+from minitorch import data, models, train
 
 random.seed(42)
+mt.manual_seed(42)
 corpus = data.CharCorpus('input.txt', block_size=16)
-model = nn.GPT(corpus.vocab_size, corpus.block_size, width=24)
-common.run_language_model_demo(model, corpus, 'NumPy tensor 版 GPT')
+model = models.GPT(corpus.vocab_size, corpus.block_size, width=32, n_layer=2, n_head=2)
+train.run_language_model_demo(model, corpus, 'minitorch GPT')

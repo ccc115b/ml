@@ -1,6 +1,6 @@
 """Module 系統與常用層：Linear、Embedding、Conv2d、LayerNorm、GRU、注意力等。
 
-權重 shape 慣例與前面手寫版 nn.py 相同：Linear 為 (in, out)，Conv2d 為 (out, in, k, k)。
+權重 shape 慣例：Linear 為 (in, out)（x @ weight），Conv2d 為 (out, in, k, k)。
 """
 
 import numpy as np
