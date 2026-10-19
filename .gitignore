@@ -1,4 +1,8 @@
 *.npz
+*.pt
+*.pth
+_old/
+
 data/
 raw/
 

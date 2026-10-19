@@ -92,6 +92,8 @@ class GPT(LanguageModel):
     """多層、多頭、pre-LayerNorm 的 causal Transformer。"""
 
     def __init__(self, vocab_size, block_size, width=32, n_layer=2, n_head=2, dropout=0.0, std=0.08):
+        self.config = dict(vocab_size=vocab_size, block_size=block_size, width=width, n_layer=n_layer,
+                           n_head=n_head, dropout=dropout, std=std)  # 存檔時用來重建相同結構
         self.block_size = block_size
         self.wte = L.Embedding(vocab_size, width, std)
         self.wpe = L.Embedding(block_size, width, std)

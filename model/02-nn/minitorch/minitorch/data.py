@@ -67,16 +67,37 @@ class DataLoader:
 # ───────── 載入具體資料集 ─────────
 
 
-class CharCorpus:
-    """逐行讀取文字檔，建立字元詞彙表；BOS 同時作為句首與句尾標記。"""
+def read_docs(path):
+    """逐行讀取文字檔，去掉空行。"""
+    try:
+        with open(path, encoding='utf-8') as file:
+            return [line.strip() for line in file if line.strip()]
+    except FileNotFoundError:
+        raise FileNotFoundError(f'找不到 {path}；請從範例庫載入。') from None
 
-    def __init__(self, path='input.txt', block_size=16):
-        try:
-            with open(path, encoding='utf-8') as file:
-                self.docs = [line.strip() for line in file if line.strip()]
-        except FileNotFoundError:
-            raise FileNotFoundError(f'找不到 {path}；請從範例庫載入。') from None
-        self.chars = sorted(set(''.join(self.docs)))
+
+def build_vocab(*doc_lists):
+    """多份文件的字元聯集（排序後）。預訓練前先把微調資料也算進來，詞彙表才能兩階段共用。"""
+    return sorted(set(''.join(''.join(docs) for docs in doc_lists)))
+
+
+def split_docs(docs, val_fraction=0.1, seed=42):
+    """固定種子切出驗證集，回傳 (訓練句子, 驗證句子)；預訓練與微調要用同一個切法。"""
+    order = np.random.default_rng(seed).permutation(len(docs))
+    n_val = max(1, round(len(docs) * val_fraction))
+    return [docs[i] for i in sorted(order[n_val:])], [docs[i] for i in sorted(order[:n_val])]
+
+
+class CharCorpus:
+    """字元級語料；BOS 同時作為句首與句尾標記。
+    預設從 path 逐行讀取並由內容建立詞彙表；也可直接給 docs，並用 vocab 指定既有的字元表（例如微調時沿用預訓練的）。"""
+
+    def __init__(self, path='input.txt', block_size=16, docs=None, vocab=None):
+        self.docs = read_docs(path) if docs is None else list(docs)
+        self.chars = sorted(set(''.join(self.docs))) if vocab is None else list(vocab)
+        unknown = set(''.join(self.docs)) - set(self.chars)
+        if unknown:
+            raise ValueError(f'詞彙表中沒有這些字元：{sorted(unknown)}')
         self.token_of = {char: index for index, char in enumerate(self.chars)}
         self.BOS = len(self.chars)
         self.vocab_size = self.BOS + 1

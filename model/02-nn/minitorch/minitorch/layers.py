@@ -43,8 +43,20 @@ class Module:
     def parameters(self):
         return [p for _, p in self.named_parameters()]
 
-    def num_parameters(self):
-        return sum(p.size for p in self.parameters())
+    def num_parameters(self, trainable_only=False):
+        return sum(p.size for p in self.parameters() if p.requires_grad or not trainable_only)
+
+    def freeze(self, *prefixes):
+        """凍結名稱以任一 prefix 開頭的參數（不再計算梯度）；回傳被凍結的參數個數。"""
+        frozen = 0
+        for name, p in self.named_parameters():
+            if name.startswith(prefixes):
+                p.requires_grad, p.grad = False, None
+                frozen += p.size
+        return frozen
+
+    def trainable_parameters(self):
+        return [p for p in self.parameters() if p.requires_grad]
 
     def zero_grad(self):
         for p in self.parameters():

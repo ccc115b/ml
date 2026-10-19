@@ -24,7 +24,7 @@ def _fit(model, loader, loss_fn, optimizer, scheduler, epochs, clip_norm, log_ev
             if scheduler:
                 scheduler.step()
             step += 1
-            if step == 1 or step % log_every == 0:
+            if log_every and (step == 1 or step % log_every == 0):  # log_every=0 代表不印
                 print(f'步驟 {step:5d} / {total}，損失 {loss.item():.4f}，{time.time() - start:.0f} 秒')
         if after_epoch:
             after_epoch(epoch)
@@ -115,3 +115,67 @@ def run_diffusion_demo(model, diffusion, images, labels, class_names, steps=3000
         viz.save_png(png_path, viz.make_grid(pictures, samples_per_class), scale=6)
         print(f'\n已儲存 {png_path}（每列一個類別：{list(class_names)}）')
     return pictures
+
+
+# ───────── 預訓練 / 微調共用的工具 ─────────
+
+def train_language_model(model, examples, epochs, lr, batch_size=16, weight_decay=0.01, clip_norm=1.0,
+                         log_every=0, seed=42, after_epoch=None, warmup_ratio=0.05, min_ratio=0.05):
+    """通用的語言模型訓練。examples 是 (tokens, targets) 的清單，targets 為 -100 的位置不計損失。
+    只會訓練 requires_grad 的參數，所以凍結（freeze）過的部分不會被更新。"""
+    loader = DataLoader(examples, batch_size, shuffle=True, collate_fn=pad_collate((0, -100)), seed=seed)
+    optimizer = AdamW(model.trainable_parameters(), lr=lr, betas=(0.9, 0.99), weight_decay=weight_decay)
+    total = len(loader) * epochs
+    scheduler = LambdaLR(optimizer, warmup_cosine(total, warmup_steps=int(total * warmup_ratio), min_ratio=min_ratio))
+    _fit(model, loader, lambda m, batch: F.cross_entropy(m(batch[0]), batch[1], ignore_index=-100),
+         optimizer, scheduler, epochs, clip_norm, log_every, after_epoch)
+
+
+def evaluate_loss(model, examples, batch_size=64):
+    """每個有效目標（非 -100）的平均交叉熵損失。"""
+    was_training = model.training
+    model.eval()
+    total, count = 0.0, 0
+    with no_grad():
+        for tokens, targets in DataLoader(examples, batch_size, collate_fn=pad_collate((0, -100))):
+            total += F.cross_entropy(model(tokens), targets, ignore_index=-100, reduction='sum').item()
+            count += int((targets != -100).sum())
+    model.train(was_training)
+    return total / count
+
+
+def sequence_nll(model, examples, batch_size=64):
+    """每個樣本「有效目標」的總負對數機率（target 為 -100 的位置不計），回傳 ndarray。數字越小代表模型越認為這個序列合理。"""
+    was_training = model.training
+    model.eval()
+    totals = []
+    with no_grad():
+        for tokens, targets in DataLoader(examples, batch_size, collate_fn=pad_collate((0, -100))):
+            nll = F.cross_entropy(model(tokens), targets, ignore_index=-100, reduction='none').data
+            totals.append(nll.reshape(targets.shape).sum(axis=1))
+    model.train(was_training)
+    return np.concatenate(totals)
+
+
+def complete(model, corpus, prompt, max_new=8, temperature=None):
+    """接續 prompt 往下寫，遇到 BOS 或達到 block_size 就停；回傳新產生的文字（不含 prompt）。
+    temperature=None 為貪婪解碼（每次都取機率最高的字，結果固定）。"""
+    was_training = model.training
+    model.eval()
+    ids, out = [corpus.BOS] + [corpus.token_of[char] for char in prompt], []
+    with no_grad():
+        for _ in range(max_new):
+            if len(ids) >= corpus.block_size:
+                break
+            logits = model(ids).data[-1]
+            if temperature is None:
+                token_id = int(logits.argmax())
+            else:
+                probabilities = np.exp((logits - logits.max()) / temperature)
+                token_id = random.choices(range(corpus.vocab_size), weights=probabilities / probabilities.sum())[0]
+            if token_id == corpus.BOS:
+                break
+            out.append(corpus.chars[token_id])
+            ids.append(token_id)
+    model.train(was_training)
+    return ''.join(out)

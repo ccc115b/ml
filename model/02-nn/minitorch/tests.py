@@ -1,5 +1,7 @@
 """minitorch 的測試：數值梯度檢查、Module / 優化器 / DataLoader 行為、擴散模型。"""
 
+import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -7,7 +9,7 @@ import traceback
 import numpy as np
 
 import minitorch as mt
-from minitorch import diffusion, functional as F, layers, models, optim
+from minitorch import checkpoint, data, diffusion, functional as F, layers, models, optim, qa, train
 from minitorch.data import DataLoader, TensorDataset, pad_collate
 
 rng = np.random.default_rng(0)
@@ -389,6 +391,172 @@ def data_and_viz_helpers():
         raw = open(path, 'rb').read()
     assert raw[:8] == b'\x89PNG\r\n\x1a\n' and raw.endswith(b'IEND\xaeB`\x82')
     assert len(viz.ascii_row(rng.random((2, 3, 3))).splitlines()) == 3
+
+
+# ───────── 6. 預訓練與微調（pretrain.txt / finetune.txt） ─────────
+
+def project_corpus():
+    pre, fine = data.read_docs('pretrain.txt'), data.read_docs('finetune.txt')
+    return data.CharCorpus(docs=pre, block_size=32, vocab=data.build_vocab(pre, fine))
+
+
+@test
+def corpus_docs_vocab_and_split():
+    corpus = data.CharCorpus(docs=['小貓'], vocab=list('小貓狗'))   # 詞彙表可以比文件大（沿用預訓練的字元表）
+    assert corpus.chars == list('小貓狗') and corpus.BOS == 3 and corpus.vocab_size == 4
+    try:
+        data.CharCorpus(docs=['小魚'], vocab=list('小貓'))
+        raise SystemExit('應該要丟出 ValueError')
+    except ValueError:
+        pass
+    assert data.build_vocab(['ba'], ['ac']) == ['a', 'b', 'c']
+    docs = [f'句子{i}' for i in range(20)]
+    train_docs, val_docs = data.split_docs(docs, 0.1, seed=1)
+    assert len(val_docs) == 2 and not set(train_docs) & set(val_docs) and sorted(train_docs + val_docs) == sorted(docs)
+    assert data.split_docs(docs, 0.1, seed=1) == (train_docs, val_docs)       # 同種子切法固定
+
+
+@test
+def finetune_file_parsing_and_folds():
+    assert qa.parse_line('<Q>火星有幾顆小衛星？<A>兩顆') == ('火星有幾顆小衛星？', '兩顆')
+    for bad in ['火星有幾顆小衛星？兩顆', '<Q>問題<A>', '<Q><A>答案', '<Q>a<A>b<A>c']:
+        try:
+            qa.parse_line(bad)
+            raise SystemExit(f'應該要丟出 ValueError：{bad}')
+        except ValueError:
+            pass
+    lines = qa.read_pairs('finetune.txt')
+    unique = qa.unique_pairs(lines)
+    assert len(lines) == 1350 and len(unique) == 50
+    assert len({q for q, _ in unique}) == 50                                  # 每個問題只有一個答案
+    assert max(len(qa.prompt(q) + a) for q, a in unique) + 1 <= 32            # 放得進 block_size=32
+    sentences = data.read_docs('pretrain.txt')
+    missing = [(q, a) for q, a in unique if not any(a in s for s in sentences)]
+    assert missing == [('火星有幾顆小衛星？', '兩顆')], missing                 # 49 題的答案逐字出現在預訓練句子裡；這題的句子寫「兩個」
+    folds = qa.make_folds(unique, k=5, seed=1)
+    assert [len(f) for f in folds] == [10] * 5 and sorted(sum(folds, [])) == unique   # 切成互不重疊的五份
+    assert qa.make_folds(unique, k=5, seed=1) == folds and qa.make_folds(unique, k=5, seed=2) != folds
+
+
+@test
+def cross_validation_has_no_leakage():
+    """驗證題目的所有重複行都必須從訓練行裡拿掉，否則驗證題目會和訓練行完全相同。"""
+    lines = qa.read_pairs('finetune.txt')
+    for held in qa.make_folds(qa.unique_pairs(lines), k=5, seed=42):
+        remaining = qa.without(lines, held)
+        assert not set(remaining) & set(held)
+        assert len(remaining) == 1350 - 10 * 27
+        assert set(remaining) | set(held) == set(lines)
+
+
+@test
+def answer_only_masking_and_loss():
+    corpus = project_corpus()
+    question, answer = qa.unique_pairs(qa.read_pairs('finetune.txt'))[0]
+    tokens, targets = qa.encode_pair(corpus, question, answer)
+    n = len(qa.prompt(question))
+    assert (targets[:n] == -100).all() and len(targets) == n + len(answer) + 1
+    assert targets[n:].tolist() == [corpus.token_of[c] for c in answer] + [corpus.BOS]   # 答案與結尾 BOS 才計損失
+    model = models.GPT(corpus.vocab_size, 32, width=8, n_layer=1, n_head=2)
+    logits = model(tokens)
+    logp = logits.log_softmax(-1).data
+    expected = -sum(logp[n + i, targets[n + i]] for i in range(len(answer) + 1)) / (len(answer) + 1)
+    assert abs(F.cross_entropy(logits, targets, ignore_index=-100).item() - expected) < 1e-9
+
+
+@test
+def checkpoint_roundtrip():
+    mt.manual_seed(0)
+    corpus = project_corpus()
+    model = models.GPT(corpus.vocab_size, 32, width=8, n_layer=2, n_head=2)
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'm.npz')
+        checkpoint.save_gpt(path, model, corpus.chars)
+        clone, chars = checkpoint.load_gpt(path)
+    ids = rng.integers(0, corpus.vocab_size, (2, 32))
+    assert chars == corpus.chars and clone.config == model.config            # 字元表含 < > Q A ？ 等符號，順序不變
+    assert np.allclose(clone(ids).data, model(ids).data)
+
+
+@test
+def freeze_blocks_updates():
+    mt.manual_seed(0)
+    corpus = project_corpus()
+    model = models.GPT(corpus.vocab_size, 32, width=8, n_layer=2, n_head=2)
+    total = model.num_parameters()
+    frozen = model.freeze('wte', 'blocks.0.')
+    assert frozen > 0 and model.num_parameters(trainable_only=True) == total - frozen
+    assert len(model.trainable_parameters()) < len(model.parameters())
+    before = model.state_dict()
+    examples = qa.encode_pairs(corpus, qa.unique_pairs(qa.read_pairs('finetune.txt'))[:8])
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        train.train_language_model(model, examples, epochs=3, lr=0.05, batch_size=4)   # log_every=0：不應印任何東西
+    assert out.getvalue() == ''
+    after = model.state_dict()
+    for name in before:
+        same = np.array_equal(before[name], after[name])
+        assert same == name.startswith(('wte', 'blocks.0.')), name           # 只有凍結的沒變
+    assert all(p.grad is None for n, p in model.named_parameters() if n.startswith('wte'))
+
+
+@test
+def evaluate_loss_complete_and_ranking():
+    mt.manual_seed(0)
+    corpus = project_corpus()
+    model = models.GPT(corpus.vocab_size, 32, width=8, n_layer=1, n_head=2)
+    unique = qa.unique_pairs(qa.read_pairs('finetune.txt'))
+    examples = qa.encode_pairs(corpus, unique[:5])
+    tokens, targets = pad_collate((0, -100))(examples)
+    summed = F.cross_entropy(model(tokens), targets, reduction='sum').item()
+    assert abs(train.evaluate_loss(model, examples, batch_size=2) - summed / (targets != -100).sum()) < 1e-9
+    assert abs(train.sequence_nll(model, examples, batch_size=2).sum() - summed) < 1e-9     # 每個樣本的總 NLL 加起來 = 總損失
+    model.train()
+    prompt = qa.prompt(unique[0][0])
+    first = train.complete(model, corpus, prompt)
+    assert first == train.complete(model, corpus, prompt) and model.training      # 貪婪解碼固定、不改變 train/eval 狀態
+    assert len(train.complete(model, corpus, prompt, max_new=3)) <= 3
+    assert train.complete(model, corpus, corpus.chars[0] * 31) == ''            # prompt + BOS 已占滿 block_size，沒有空間續寫
+    assert len(train.complete(model, corpus, corpus.chars[0] * 30, max_new=5)) <= 1   # 只剩一個位置
+    assert set(train.complete(model, corpus, prompt, temperature=0.8)) <= set(corpus.chars)
+    # 選擇題名次：1 ≤ 名次 ≤ 放得下的候選數；模型完全不懂時平均名次接近亂猜
+    candidates = sorted({a for _, a in unique})
+    ranks = qa.answer_ranks(model, corpus, unique[:6], candidates)
+    assert all(1 <= r <= len(candidates) for r in ranks)
+    assert 1 <= qa.expected_random_rank(corpus, unique, candidates) <= len(candidates)
+
+
+@test
+def ranking_prefers_the_trained_answer():
+    """讓模型過度訓練在單一題目上，這題的正確答案名次必須是第 1。"""
+    mt.manual_seed(0)
+    corpus = project_corpus()
+    unique = qa.unique_pairs(qa.read_pairs('finetune.txt'))
+    candidates = sorted({a for _, a in unique})
+    model = models.GPT(corpus.vocab_size, 32, width=16, n_layer=1, n_head=2)
+    target = unique[3]
+    train.train_language_model(model, qa.encode_pairs(corpus, [target] * 16), epochs=20, lr=0.02, weight_decay=0.0)
+    assert qa.answer_ranks(model, corpus, [target], candidates) == [1]
+    assert qa.answer_accuracy(model, corpus, [target]) == 1.0
+
+
+@test
+def pretrain_then_finetune_reduces_qa_loss():
+    """縮小版完整流程：預訓練 → 存檔 → 載入 → 微調，問答損失應明顯下降，且預訓練的權重確實被帶進來。"""
+    mt.manual_seed(0)
+    corpus = project_corpus()
+    model = models.GPT(corpus.vocab_size, 32, width=16, n_layer=1, n_head=2)
+    pretrain_examples = corpus.examples()[:600]
+    train.train_language_model(model, pretrain_examples, epochs=2, lr=0.01)
+    with tempfile.TemporaryDirectory() as d:
+        checkpoint.save_gpt(os.path.join(d, 'p.npz'), model, corpus.chars)
+        loaded, chars = checkpoint.load_gpt(os.path.join(d, 'p.npz'))
+    pairs = qa.read_pairs('finetune.txt')[:300]
+    examples = qa.encode_pairs(data.CharCorpus(docs=[], block_size=32, vocab=chars), pairs)
+    before = train.evaluate_loss(loaded, examples)
+    train.train_language_model(loaded, examples, epochs=2, lr=0.003, weight_decay=0.0)
+    assert train.evaluate_loss(loaded, examples) < 0.5 * before
+    assert np.allclose(loaded.wte.weight.data, model.wte.weight.data, atol=0.5)   # 微調只小幅移動權重，沒有重新初始化
 
 
 if __name__ == '__main__':
