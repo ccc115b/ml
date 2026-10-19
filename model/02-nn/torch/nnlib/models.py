@@ -73,6 +73,8 @@ class GRULanguageModel(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
+    force_manual = False  # 設為 True 可強制使用手寫注意力（測試用）；MPS 上預設就用手寫版
+
     def __init__(self, width, n_head, dropout):
         super().__init__()
         assert width % n_head == 0, 'width 必須能被 n_head 整除'
@@ -80,12 +82,23 @@ class CausalSelfAttention(nn.Module):
         self.qkv = nn.Linear(width, 3 * width)
         self.proj = nn.Linear(width, width)
 
+    def _manual_attention(self, q, k, v):
+        """手寫的因果注意力，只用最基本的運算，各種裝置（含 MPS）都支援。"""
+        length = q.shape[-2]
+        scores = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+        future = torch.triu(torch.ones(length, length, dtype=torch.bool, device=q.device), diagonal=1)
+        scores = scores.masked_fill(future, torch.finfo(scores.dtype).min)
+        return F.dropout(scores.softmax(dim=-1), self.dropout, self.training) @ v
+
     def forward(self, x):
         batch, length, width = x.shape
         q, k, v = self.qkv(x).split(width, dim=2)
         q, k, v = (t.view(batch, length, self.n_head, width // self.n_head).transpose(1, 2) for t in (q, k, v))
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0,
-                                             is_causal=True)
+        if self.force_manual or x.device.type == 'mps':
+            out = self._manual_attention(q, k, v)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, dropout_p=self.dropout if self.training else 0.0,
+                                                 is_causal=True)
         return self.proj(out.transpose(1, 2).reshape(batch, length, width))
 
 
@@ -107,6 +120,8 @@ class GPT(nn.Module):
 
     def __init__(self, vocab_size, block_size, width=32, n_layer=2, n_head=2, dropout=0.0, std=0.08):
         super().__init__()
+        self.config = dict(vocab_size=vocab_size, block_size=block_size, width=width, n_layer=n_layer,
+                           n_head=n_head, dropout=dropout, std=std)  # 存檔時用來重建相同結構
         self.block_size = block_size
         self.wte = nn.Embedding(vocab_size, width)
         self.wpe = nn.Embedding(block_size, width)

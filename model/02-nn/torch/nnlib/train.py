@@ -1,6 +1,7 @@
 """訓練流程：分類、語言模型、擴散模型的訓練迴圈與取樣，以及可直接呼叫的完整 demo。"""
 
 import math
+import os
 import random
 import time
 import numpy as np
@@ -12,12 +13,22 @@ from torch.utils.data import DataLoader, TensorDataset
 from . import viz
 
 
-def get_device():
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    if getattr(torch.backends, 'mps', None) is not None and torch.backends.mps.is_available():
-        return torch.device('mps')
-    return torch.device('cpu')
+def _mps_available():
+    mps = getattr(torch.backends, 'mps', None)
+    return mps is not None and mps.is_available()
+
+
+def get_device(name=None):
+    """選擇運算裝置。預設自動挑選：CUDA → Apple MPS → CPU；
+    也可用參數或環境變數指定，例如 DEVICE=cpu ./run.sh（小模型在 CPU 上有時反而比 GPU 快）。"""
+    name = (name or os.environ.get('DEVICE', 'auto')).lower()
+    if name == 'auto':
+        name = 'cuda' if torch.cuda.is_available() else 'mps' if _mps_available() else 'cpu'
+    if name == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('找不到 CUDA 裝置')
+    if name == 'mps' and not _mps_available():
+        raise RuntimeError('此環境無法使用 MPS：需要 Apple Silicon、macOS 12.3 以上，以及 macOS 版的 PyTorch')
+    return torch.device(name)
 
 
 def set_seed(seed=42):
@@ -26,8 +37,8 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
 
 
-def count_parameters(model):
-    return sum(p.numel() for p in model.parameters())
+def count_parameters(model, trainable_only=False):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad or not trainable_only)
 
 
 def warmup_cosine(total_steps, warmup_steps=0, min_ratio=0.0):
@@ -42,7 +53,8 @@ def warmup_cosine(total_steps, warmup_steps=0, min_ratio=0.0):
 def _fit(model, loader, loss_fn, device, lr, weight_decay, epochs, warmup_steps, min_ratio,
          clip_norm, log_every, after_epoch=None):
     total = len(loader) * epochs
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.99), weight_decay=weight_decay)
+    trainable = [p for p in model.parameters() if p.requires_grad]  # 凍結的參數不交給優化器
+    optimizer = torch.optim.AdamW(trainable, lr=lr, betas=(0.9, 0.99), weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_cosine(total, warmup_steps, min_ratio))
     step, start = 0, time.time()
     for epoch in range(epochs):
@@ -53,11 +65,11 @@ def _fit(model, loader, loss_fn, device, lr, weight_decay, epochs, warmup_steps,
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             if clip_norm:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip_norm)
+                torch.nn.utils.clip_grad_norm_(trainable, clip_norm)
             optimizer.step()
             scheduler.step()
             step += 1
-            if step == 1 or step % log_every == 0:
+            if log_every and (step == 1 or step % log_every == 0):  # log_every=0 代表不印
                 print(f'步驟 {step:5d} / {total}，損失 {loss.item():.4f}，{time.time() - start:.0f} 秒')
         if after_epoch:
             after_epoch(epoch)
@@ -138,6 +150,90 @@ def run_language_model_demo(model, corpus, title, batch_size=16, epochs=60, lr=0
     print(f'\n--- 生成的句子（{title}） ---')
     for index, sentence in enumerate(generate(model, corpus, device), 1):
         print(f'{index:2d}. {sentence}')
+
+
+# ───────── 預訓練 / 微調共用的工具 ─────────
+
+def _device_of(model):
+    return next(model.parameters()).device
+
+
+def freeze(model, *prefixes):
+    """凍結名稱以任一 prefix 開頭的參數（不再計算梯度）；回傳被凍結的參數個數。"""
+    frozen = 0
+    for name, p in model.named_parameters():
+        if name.startswith(prefixes):
+            p.requires_grad_(False)
+            frozen += p.numel()
+    return frozen
+
+
+def _lm_loss(model, tokens, targets, reduction='mean'):
+    logits = model(tokens)
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1),
+                           ignore_index=-100, reduction=reduction)
+
+
+def train_language_model(model, examples, epochs, lr, batch_size=16, weight_decay=0.01, clip_norm=1.0,
+                         log_every=0, seed=42, after_epoch=None, warmup_ratio=0.05, min_ratio=0.05):
+    """通用的語言模型訓練。examples 是 (tokens, targets) 的清單，targets 為 -100 的位置不計損失。
+    只會訓練 requires_grad 的參數，所以凍結（freeze）過的部分不會被更新。"""
+    loader = _loader(examples, batch_size, seed, collate_fn=_pad_collate)
+    total = len(loader) * epochs
+    _fit(model, loader, _lm_loss, _device_of(model), lr, weight_decay, epochs, int(total * warmup_ratio),
+         min_ratio, clip_norm, log_every, after_epoch)
+
+
+@torch.no_grad()
+def evaluate_loss(model, examples, batch_size=64):
+    """每個有效目標（非 -100）的平均交叉熵損失。"""
+    device, was_training = _device_of(model), model.training
+    model.eval()
+    total, count = 0.0, 0
+    for tokens, targets in DataLoader(examples, batch_size, collate_fn=_pad_collate):
+        tokens, targets = tokens.to(device), targets.to(device)
+        total += _lm_loss(model, tokens, targets, reduction='sum').item()
+        count += int((targets != -100).sum())
+    model.train(was_training)
+    return total / count
+
+
+@torch.no_grad()
+def sequence_nll(model, examples, batch_size=64):
+    """每個樣本「有效目標」的總負對數機率（target 為 -100 的位置不計），回傳 ndarray。數字越小代表模型越認為這個序列合理。"""
+    device, was_training = _device_of(model), model.training
+    model.eval()
+    totals = []
+    for tokens, targets in DataLoader(examples, batch_size, collate_fn=_pad_collate):
+        tokens, targets = tokens.to(device), targets.to(device)
+        nll = _lm_loss(model, tokens, targets, reduction='none')
+        totals.append(nll.reshape(targets.shape).sum(dim=1).cpu().numpy())
+    model.train(was_training)
+    return np.concatenate(totals)
+
+
+@torch.no_grad()
+def complete(model, corpus, prompt, max_new=8, temperature=None):
+    """接續 prompt 往下寫，遇到 BOS 或達到 block_size 就停；回傳新產生的文字（不含 prompt）。
+    temperature=None 為貪婪解碼（每次都取機率最高的字，結果固定）。"""
+    device, was_training = _device_of(model), model.training
+    model.eval()
+    ids, out = [corpus.BOS] + [corpus.token_of[char] for char in prompt], []
+    for _ in range(max_new):
+        if len(ids) >= corpus.block_size:
+            break
+        logits = model(torch.tensor([ids], device=device))[0, -1]
+        if temperature is None:
+            token_id = int(logits.argmax())
+        else:
+            probabilities = torch.softmax(logits / temperature, dim=-1).tolist()
+            token_id = random.choices(range(corpus.vocab_size), weights=probabilities)[0]
+        if token_id == corpus.BOS:
+            break
+        out.append(corpus.chars[token_id])
+        ids.append(token_id)
+    model.train(was_training)
+    return ''.join(out)
 
 
 # ───────── 擴散模型 ─────────
