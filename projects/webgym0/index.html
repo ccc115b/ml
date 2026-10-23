@@ -1,0 +1,57 @@
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>webgym0</title>
+<style>
+:root{--bg:#fff;--fg:#222;--bd:#ccc}@media(prefers-color-scheme:dark){:root{--bg:#1c1c1e;--fg:#eee;--bd:#555}}
+body{font:15px system-ui,sans-serif;background:var(--bg);color:var(--fg);max-width:720px;margin:20px auto;padding:0 12px}
+canvas{width:100%;margin-bottom:4px;border:1px solid var(--bd);border-radius:8px;background:var(--bg)}
+select,button{font:inherit;padding:6px 10px;margin:4px 4px 4px 0}pre{background:#8881;padding:8px;border-radius:8px;white-space:pre-wrap}
+</style></head><body>
+<h2>webgym0 · 純前端 RL Gym</h2>
+<select id="env"></select>
+<button id="cf">▶ closed-form 策略</button><button id="rnd">▶ 隨機策略</button><br><button id="train">🧠 強化學習 (REINFORCE)</button><button id="tfp">▶ RL 學生</button> <button id="imi">🎓 模仿 closed-form 老師</button><button id="stp">▶ 模仿學生</button><button id="bench">📊 跑 100 回合</button>
+<canvas id="cv" width="720" height="300"></canvas><canvas id="cv2" width="720" height="90"></canvas><p id="note" style="font-size:13px;opacity:.8;margin:4px 0">🧠 強化學習：沒有老師、只看環境獎勵試錯。🎓 模仿學習：老師 = closed-form 策略，學生只學「老師在這個狀態會怎麼做」，不看獎勵。</p><pre id="out">選擇環境後按播放。</pre>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script type="module">
+import { list, make, rollout, rng } from './src/core.js'; import './src/envs.js'; import { closedForm } from './src/closedForm.js'; import { createAgent, trainable } from './src/rl.js'; import { createStudent, imitable } from './src/imitate.js'; import { initMujoco } from './src/mj.js';
+const $ = id => document.getElementById(id), g = $('cv').getContext('2d'); let timer;
+list().forEach(id => $('env').add(new Option(id, id)));
+let cur; const agents = {}, students = {}, NAMES = { cf: 'closed-form 老師', rnd: '隨機', tf: 'RL 學生(自己試錯)', st: '模仿學生(學 closed-form 老師)' }; const policies = env => { const r = rng(7); return { cf: closedForm[env.id].policy(env), tf: agents[env.id]?.greedy, st: students[env.id]?.act, rnd: () => env.continuous ? [r(), r()] : Math.floor(r() * env.nA) }; };
+function play(kind) {
+  clearInterval(timer); cur?.close?.(); const env = cur = make($('env').value), pi = policies(env)[kind], seed = Date.now() & 0xffff; if (!pi) return void ($('out').textContent = (kind == 'st' ? '請先按「🎓 模仿 closed-form 老師」。' : '請先按「🧠 強化學習」。'));
+  let o = env.reset(seed), R = 0, n = 0; const draw = () => { g.clearRect(0, 0, 720, 300); env.render(g, 720, 300); };
+  draw(); timer = setInterval(() => { let r; for (let i = 0; i < (env.spf || 1); i++) { r = env.step(pi(o)); o = r.obs; R += r.reward; n++; if (r.done || r.truncated) break; } draw();
+    $('out').textContent = `${env.id} [${NAMES[kind]}] step=${n} return=${R}`;
+    if (r.done || r.truncated) { clearInterval(timer); $('out').textContent += r.done ? '  (結束)' + (env.id == 'Snake-v0' && r.done && R == 63 ? ' 🏆 吃滿棋盤!' : '') : '  (存活到上限 ✔)'; } }, 20 * (env.slow || 1));
+}
+const g2 = $('cv2').getContext('2d'), SOLVED = { 'CartPole-v1': 475, 'FrozenLake-v1-noslip': 0.99, 'FrozenLake-v1': 0.65, 'CliffWalking-v0': -16 }; let training = false;
+const curve = (h, title) => { g2.clearRect(0, 0, 720, 90); g2.fillStyle = '#888'; g2.fillText(title, 8, 12); const lo = Math.min(...h), sp = Math.max(...h) - lo || 1; g2.strokeStyle = '#378add'; g2.beginPath();
+  h.forEach((v, i) => g2[i ? 'lineTo' : 'moveTo'](5 + i / Math.max(h.length - 1, 1) * 710, 85 - (v - lo) / sp * 75)); g2.stroke(); };
+$('train').onclick = async () => { if (training) { training = false; return; } const id = $('env').value;
+  if (!trainable(id)) return void ($('out').textContent = '此環境暫不支援訓練（連續動作 / 物件觀察 / 探索太稀疏）。');
+  clearInterval(timer); training = true; $('train').textContent = '⏹ 停止'; $('note').textContent = '🧠 強化學習：沒有老師，只靠環境獎勵試錯學習 (REINFORCE)。'; const ag = createAgent(tf, make(id)); agents[id] = ag; const h = [];
+  for (let i = 1; i <= 500 && training; i++) { h.push(ag.trainIter()); curve(h, '強化學習：批次平均回報（沒有老師，只靠環境獎勵試錯）'); const m = h.slice(-5).reduce((a, b) => a + b) / Math.min(5, h.length);
+    $('out').textContent = `訓練中 ${id}  iter ${i}  批次平均回報 ${h[i - 1].toFixed(2)}  (近5批 ${m.toFixed(2)})`;
+    if (i >= 5 && m >= SOLVED[id]) { $('out').textContent += '  ✔ 達標，按「訓練後策略」播放'; break; } await tf.nextFrame(); }
+  training = false; $('train').textContent = '🧠 強化學習 (REINFORCE)'; };
+// MuJoCo (WASM ≈ 11 MB)：先試本機 node_modules (npm i 後由 serve.mjs 提供)，失敗再走 CDN；載入完成才加入 Mj* 環境
+(async () => { $('out').textContent = '⏳ 載入 MuJoCo WASM（約 11 MB）…';
+  try { await initMujoco(async () => { for (const u of ['./node_modules/@mujoco/mujoco/mujoco.js', 'https://cdn.jsdelivr.net/npm/@mujoco/mujoco@3.17.0/mujoco.js'])
+        try { return await (await import(u)).default(); } catch (e) { /* 試下一個來源 */ } throw new Error('兩個來源都載入失敗'); });
+    list().filter(id => ![...$('env').options].some(o => o.value == id)).forEach(id => $('env').add(new Option(id, id)));
+    $('out').textContent = '✔ MuJoCo 已載入：MjReacher / MjInvertedDoublePendulum / MjSwimmer 可用（解析控制器 + 模仿學習）。'; }
+  catch (e) { $('out').textContent = 'MuJoCo 載入失敗（不影響其他環境）：' + e.message; } })();
+$('tfp').onclick = () => play('tf'); $('stp').onclick = () => play('st');
+$('imi').onclick = async () => { if (training) { training = false; return; } const id = $('env').value;
+  if (!imitable(id)) return void ($('out').textContent = '模仿學習示範針對 MountainCar / Snake / Braitenberg（強化學習學不好的環境）；其他環境請用「強化學習」。');
+  clearInterval(timer); training = true; $('imi').textContent = '⏹ 停止';
+  $('note').textContent = '🎓 模仿學習 (DAgger)：老師 = closed-form 策略。學生網路只看觀察值與老師的標準答案，完全不看環境獎勵；每輪讓學生自己玩，經過的每個狀態都請老師重新標註，再累積訓練。';
+  const st = createStudent(tf, make(id)); students[id] = st; const h = [], pass = closedForm[id].pass;
+  for (let i = 1; i <= 12 && training; i++) { const r = await st.iterate(); h.push(r.studentReturn); curve(h, '學生回報（學生從不看獎勵，只模仿 closed-form 老師）');
+    $('out').textContent = `🎓 學生模仿老師 ${id}  第 ${r.iter} 輪｜老師標註累計 ${r.n} 筆｜` + (st.cont ? `與老師輪速誤差 ${r.mae.toFixed(3)}` : `與老師一致率 ${(r.match * 100).toFixed(1)}%`) + `｜學生回報 ${r.studentReturn.toFixed(1)}（老師水準 ≥ ${pass}）`;
+    if (r.studentReturn >= pass) { $('out').textContent += '  ✔ 學生出師！按「▶ 模仿學生」播放'; break; } await tf.nextFrame(); }
+  training = false; $('imi').textContent = '🎓 模仿 closed-form 老師'; };
+$('cf').onclick = () => play('cf'); $('rnd').onclick = () => play('rnd');
+$('bench').onclick = () => { clearInterval(timer); const env = make($('env').value), p = policies(env), N = env.model ? 20 : 100; let s = '';
+  for (const k of ['cf', 'rnd', 'tf', 'st'].filter(k => p[k])) { let sum = 0; for (let i = 0; i < N; i++) sum += rollout(env, p[k], i).R; s += `${NAMES[k]}: 平均回報 ${(sum / N).toFixed(2)}\n`; }
+  env.close?.(); $('out').textContent = `${env.id} (${N} 回合)\n` + s; };
+</script></body></html>
