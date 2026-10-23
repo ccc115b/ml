@@ -25,7 +25,11 @@ export const closedForm = {
       return o => { const s = [o[0], Math.atan2(o[1], o[3]), Math.atan2(o[2], o[4]), o[5], o[6], o[7]]; return [-K.reduce((a, k, i) => a + k * s[i], 0)]; }; }, pass: 9100 },
   // Swimmer：行進波 CPG。步態時鐘 (sin c, cos c) 由環境提供，第二關節落後第一關節 LAG 相位
   'MjSwimmer-v0': { policy: () => o => { const sn = o[8], cs = o[9]; return [AMP * sn, AMP * (sn * Math.cos(LAG) - cs * Math.sin(LAG))]; }, pass: 150 },
+  // HalfCheetah：開環正弦步態 a_i = clip(A_i·sin(c+φ_i)+b_i)，c 為環境提供的步態時鐘 (sin c, cos c = obs[17], obs[18])。
+  // 注意：A、φ、b 與時鐘週期 0.25s 是離線隨機搜尋 + 爬山得到的，並非推導；A>1 時被 clip 成近似方波 (4 Hz 的高頻步態)
+  'MjHalfCheetah-v0': { policy: () => o => CHEETAH.map(([A, ph, b]) => Math.max(-1, Math.min(1, A * (o[17] * Math.cos(ph) + o[18] * Math.sin(ph)) + b))), pass: 3500, studentPass: 3000 },
 };
+const CHEETAH = [[-1.561, 6.013, .728], [2.496, 5.08, .166], [-1.194, 5.318, .232], [.901, 5.024, .281], [1.866, 5.386, .031], [1.487, 4.795, .226]];
 const KP = .35, KD = .06, QDIAG = [1, 50, 50, 1, 5, 5], RR = .1, AMP = 1, LAG = .7; // Swimmer 的 LAG 與環境時鐘週期 1.8s 由離線掃描定出
 const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
 const mm = (a, b) => a.map(r => b[0].map((_, j) => r.reduce((s, v, k) => s + v * b[k][j], 0)));

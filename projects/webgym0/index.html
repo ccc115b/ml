@@ -15,9 +15,9 @@ select,button{font:inherit;padding:6px 10px;margin:4px 4px 4px 0}pre{background:
 import { list, make, rollout, rng } from './src/core.js'; import './src/envs.js'; import { closedForm } from './src/closedForm.js'; import { createAgent, trainable } from './src/rl.js'; import { createStudent, imitable } from './src/imitate.js'; import { initMujoco } from './src/mj.js';
 const $ = id => document.getElementById(id), g = $('cv').getContext('2d'); let timer;
 list().forEach(id => $('env').add(new Option(id, id)));
-let cur; const agents = {}, students = {}, NAMES = { cf: 'closed-form 老師', rnd: '隨機', tf: 'RL 學生(自己試錯)', st: '模仿學生(學 closed-form 老師)' }; const policies = env => { const r = rng(7); return { cf: closedForm[env.id].policy(env), tf: agents[env.id]?.greedy, st: students[env.id]?.act, rnd: () => env.continuous ? [r(), r()] : Math.floor(r() * env.nA) }; };
+let cur; const agents = {}, students = {}, NAMES = { cf: 'closed-form 老師', rnd: '隨機', tf: 'RL 學生(自己試錯)', st: '模仿學生(學 closed-form 老師)' }; const policies = env => { const r = rng(7); return { cf: closedForm[env.id]?.policy(env), tf: agents[env.id]?.greedy, st: students[env.id]?.act, rnd: () => env.continuous ? [r(), r()] : Math.floor(r() * env.nA) }; };
 function play(kind) {
-  clearInterval(timer); cur?.close?.(); const env = cur = make($('env').value), pi = policies(env)[kind], seed = Date.now() & 0xffff; if (!pi) return void ($('out').textContent = (kind == 'st' ? '請先按「🎓 模仿 closed-form 老師」。' : '請先按「🧠 強化學習」。'));
+  clearInterval(timer); cur?.close?.(); const env = cur = make($('env').value), pi = policies(env)[kind], seed = Date.now() & 0xffff; if (!pi) return void ($('out').textContent = ({ cf: '此環境尚無 closed-form 老師（只提供環境與隨機策略基準）。', st: '請先按「🎓 模仿 closed-form 老師」。' }[kind] || '請先按「🧠 強化學習」。'));
   let o = env.reset(seed), R = 0, n = 0; const draw = () => { g.clearRect(0, 0, 720, 300); env.render(g, 720, 300); };
   draw(); timer = setInterval(() => { let r; for (let i = 0; i < (env.spf || 1); i++) { r = env.step(pi(o)); o = r.obs; R += r.reward; n++; if (r.done || r.truncated) break; } draw();
     $('out').textContent = `${env.id} [${NAMES[kind]}] step=${n} return=${R}`;
@@ -38,14 +38,15 @@ $('train').onclick = async () => { if (training) { training = false; return; } c
   try { await initMujoco(async () => { for (const u of ['./node_modules/@mujoco/mujoco/mujoco.js', 'https://cdn.jsdelivr.net/npm/@mujoco/mujoco@3.17.0/mujoco.js'])
         try { return await (await import(u)).default(); } catch (e) { /* 試下一個來源 */ } throw new Error('兩個來源都載入失敗'); });
     list().filter(id => ![...$('env').options].some(o => o.value == id)).forEach(id => $('env').add(new Option(id, id)));
-    $('out').textContent = '✔ MuJoCo 已載入：MjReacher / MjInvertedDoublePendulum / MjSwimmer 可用（解析控制器 + 模仿學習）。'; }
+    $('out').textContent = '✔ MuJoCo 已載入：Reacher / 雙擺 / Swimmer / HalfCheetah 有解析老師可模仿；Walker2d / Humanoid 目前只提供環境與隨機基準。'; }
   catch (e) { $('out').textContent = 'MuJoCo 載入失敗（不影響其他環境）：' + e.message; } })();
+$('env').onchange = () => { const id = $('env').value; if (!closedForm[id]) $('out').textContent = id + '：只提供環境與隨機策略基準，尚無 closed-form 老師（此類環境需要學習型老師，例如之後加入 PPO/SAC）。'; };
 $('tfp').onclick = () => play('tf'); $('stp').onclick = () => play('st');
 $('imi').onclick = async () => { if (training) { training = false; return; } const id = $('env').value;
-  if (!imitable(id)) return void ($('out').textContent = '模仿學習示範針對 MountainCar / Snake / Braitenberg（強化學習學不好的環境）；其他環境請用「強化學習」。');
+  if (!imitable(id)) return void ($('out').textContent = '此環境不支援模仿：' + (closedForm[id] ? '請改用「🧠 強化學習」。' : '沒有 closed-form 老師可模仿（Walker2d / Humanoid 目前只提供環境與隨機基準）。'));
   clearInterval(timer); training = true; $('imi').textContent = '⏹ 停止';
   $('note').textContent = '🎓 模仿學習 (DAgger)：老師 = closed-form 策略。學生網路只看觀察值與老師的標準答案，完全不看環境獎勵；每輪讓學生自己玩，經過的每個狀態都請老師重新標註，再累積訓練。';
-  const st = createStudent(tf, make(id)); students[id] = st; const h = [], pass = closedForm[id].pass;
+  const st = createStudent(tf, make(id)); students[id] = st; const h = [], pass = closedForm[id].studentPass ?? closedForm[id].pass;
   for (let i = 1; i <= 12 && training; i++) { const r = await st.iterate(); h.push(r.studentReturn); curve(h, '學生回報（學生從不看獎勵，只模仿 closed-form 老師）');
     $('out').textContent = `🎓 學生模仿老師 ${id}  第 ${r.iter} 輪｜老師標註累計 ${r.n} 筆｜` + (st.cont ? `與老師輪速誤差 ${r.mae.toFixed(3)}` : `與老師一致率 ${(r.match * 100).toFixed(1)}%`) + `｜學生回報 ${r.studentReturn.toFixed(1)}（老師水準 ≥ ${pass}）`;
     if (r.studentReturn >= pass) { $('out').textContent += '  ✔ 學生出師！按「▶ 模仿學生」播放'; break; } await tf.nextFrame(); }

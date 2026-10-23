@@ -37,3 +37,14 @@
 - `npm run test:mujoco`：驗證解析控制器，並讓 TF.js 學生 (DAgger) 模仿老師後也通過。
 - 這三個環境為連續動作，只提供「模仿學習」，不提供 REINFORCE。
 - MuJoCo 物件在 WASM heap，不會被 JS GC：環境提供 `close()`。
+
+### 運動環境 (Gymnasium 原始模型)
+模型為 Gymnasium 的 `half_cheetah.xml` / `walker2d_v5.xml` / `humanoid.xml`（未修改，MIT，見 `LICENSE-gymnasium.txt`，內嵌於 `src/mjModels.js`）。obs / reward / 終止條件依 v5 設計重寫並簡化（Humanoid 的 obs 為 qpos[2:]+qvel 共 45 維，未含 cinert 等；前進速度取根節點 x 位置差），**非逐位元相同**。
+
+| 環境 | 老師 | 說明 |
+|---|---|---|
+| MjHalfCheetah-v0 | 開環正弦步態 `clip(A·sin(c+φ)+b)` | 環境提供步態時鐘 sin/cos；**A、φ、b 與週期 0.25s 是離線隨機搜尋 + 爬山得到的，並非推導**；A>1 時近似方波，為 4 Hz 高頻步態，可能利用模擬器特性，不是自然步態。軀幹不翻倒。通過條件：平均回報 ≥ 3500（學生 ≥ 3000）|
+| MjWalker2d-v0 | 無 | 只提供環境 + 隨機基準（隨機策略約 20 步摔倒）。沒有簡潔的 closed-form 平衡/步行控制器 |
+| MjHumanoid-v0 | 無 | 同上（隨機策略約 20 多步倒下）|
+
+Walker2d / Humanoid 需要「學習型老師」(PPO/SAC 等) 才能做模仿示範，留待之後。

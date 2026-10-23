@@ -1,5 +1,6 @@
 // MuJoCo 環境：動力學由 MuJoCo (WASM) 計算；obs / reward / 終止條件仿 Gymnasium 重寫（非逐位元相同，故命名 Mj*）。
 import { rng, register } from './core.js';
+import { XML } from './mjModels.js';
 let MJ = null;
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const sq = a => [].concat(a).reduce((s, x) => s + clamp(x, -1, 1) ** 2, 0);
@@ -11,8 +12,20 @@ class MjEnv {
   begin(seed) { this.rng = rng(seed); MJ.mj_resetData(this.model, this.data); this.t = 0; }
   u(a, b) { return a + (b - a) * this.rng(); }
   gauss() { return Math.sqrt(-2 * Math.log(1 - this.rng())) * Math.cos(2 * Math.PI * this.rng()); }
-  sim(a) { const c = this.data.ctrl; [].concat(a).forEach((v, i) => c[i] = clamp(v, -1, 1));
+  clipA(a) { return [].concat(a).map(v => clamp(v, this.range[0], this.range[1])); }
+  cost(a) { return this.clipA(a).reduce((s, x) => s + x * x, 0); }
+  sim(a) { const c = this.data.ctrl; this.clipA(a).forEach((v, i) => c[i] = v);
     for (let i = 0; i < this.frameSkip; i++) MJ.mj_step(this.model, this.data); this.t++; }
+  // 通用側視渲染 (x-z 平面)：由 MuJoCo 的 geom 位姿畫膠囊/球，鏡頭跟隨根節點
+  renderSide(g, W, H, k = 110) { const m = this.model, d = this.data, cx = this.q[0], X = x => W / 2 + (x - cx) * k, Z = z => H * .82 - z * k;
+    g.strokeStyle = '#8886'; g.beginPath(); g.moveTo(0, Z(0)); g.lineTo(W, Z(0)); g.stroke();
+    for (let i = Math.floor(cx - W / 2 / k); i <= cx + W / 2 / k; i++) { g.beginPath(); g.moveTo(X(i), Z(0)); g.lineTo(X(i), Z(0) + 8); g.stroke(); }
+    g.lineCap = 'round';
+    for (let i = 0; i < m.ngeom; i++) { const t = m.geom_type[i]; if (t != 2 && t != 3) continue; // 2 球 3 膠囊
+      const P = d.geom_xpos, R = d.geom_xmat, r = m.geom_size[3 * i], h = t == 3 ? m.geom_size[3 * i + 1] : 0, ax = R[9 * i + 2], az = R[9 * i + 8];
+      g.strokeStyle = i % 2 ? '#378add' : '#639922'; g.lineWidth = Math.max(2, 2 * r * k);
+      g.beginPath(); g.moveTo(X(P[3 * i] - h * ax), Z(P[3 * i + 2] - h * az)); g.lineTo(X(P[3 * i] + h * ax), Z(P[3 * i + 2] + h * az)); g.stroke(); }
+    g.lineWidth = 1; }
   get q() { return this.data.qpos; } get v() { return this.data.qvel; }
 }
 
@@ -96,10 +109,31 @@ class Swimmer extends MjEnv {
     [j1, j2, tail].forEach(p => g.lineTo(X(p[0]), Y(p[1]))); g.stroke(); g.lineWidth = 1; }
 }
 
-export const mjIds = ['MjReacher-v0', 'MjInvertedDoublePendulum-v0', 'MjSwimmer-v0'];
+/* ---------- 運動環境：HalfCheetah / Walker2d / Humanoid（Gymnasium 原始模型，obs/reward 依 v5 設計簡化重寫）---------- */
+class Loco extends MjEnv {
+  maxSteps = 1000; qSkip = 1; vClip = 0; noise = .01; gaussV = false; fwdW = 1; ctrlW = 0; alive = 0; term = false; clock = false; period = 1; k = 110;
+  healthy() { return true; }
+  obs() { const q = Array.from(this.q).slice(this.qSkip), v = Array.from(this.v, x => this.vClip ? clamp(x, -this.vClip, this.vClip) : x);
+    if (!this.clock) return [...q, ...v]; const c = 2 * Math.PI * this.t * this.dt / this.period; return [...q, ...v, Math.sin(c), Math.cos(c)]; }
+  reset(seed) { this.begin(seed); const q = this.q, v = this.v, s = this.noise;
+    for (let i = 0; i < q.length; i++) q[i] += this.u(-s, s); for (let i = 0; i < v.length; i++) v[i] += this.gaussV ? .1 * this.gauss() : this.u(-s, s);
+    MJ.mj_forward(this.model, this.data); return this.obs(); }
+  step(a) { const x0 = this.q[0]; this.sim(a); const vx = (this.q[0] - x0) / this.dt, ok = this.healthy(), done = this.term && !ok;
+    return { obs: this.obs(), reward: this.fwdW * vx + (ok ? this.alive : 0) - this.ctrlW * this.cost(a), done, truncated: !done && this.t >= this.maxSteps, vx }; }
+  render(g, W, H) { this.renderSide(g, W, H, this.k); }
+}
+class HalfCheetah extends Loco { id = 'MjHalfCheetah-v0'; nA = 6; frameSkip = 5; spf = 2; xml = XML.cheetah; noise = .1; gaussV = true; ctrlW = .1; clock = true; period = PERIOD_CHEETAH; }
+class Walker2d extends Loco { id = 'MjWalker2d-v0'; nA = 6; frameSkip = 4; xml = XML.walker; vClip = 10; noise = 5e-3; ctrlW = 1e-3; alive = 1; term = true;
+  healthy() { const q = this.q; return q[1] > .8 && q[1] < 2 && Math.abs(q[2]) < 1; } }
+class Humanoid extends Loco { id = 'MjHumanoid-v0'; nA = 17; frameSkip = 5; xml = XML.humanoid; qSkip = 2; noise = .01; fwdW = 1.25; ctrlW = .1; alive = 5; term = true; range = [-.4, .4]; k = 90;
+  healthy() { const z = this.q[2]; return z > 1 && z < 2; } }
+const PERIOD_CHEETAH = 0.25; // 步態時鐘週期(秒)，與 closedForm.js 的 CHEETAH 參數一組
+
+export const mjIds = ['MjReacher-v0', 'MjInvertedDoublePendulum-v0', 'MjSwimmer-v0', 'MjHalfCheetah-v0', 'MjWalker2d-v0', 'MjHumanoid-v0'];
 // loadMujoco: 回傳 MuJoCo 模組的 async 函式（Node: 套件 default export；瀏覽器: CDN 的 ESM）
 export async function initMujoco(loadMujoco) {
   if (!MJ) MJ = await loadMujoco();
   const open = C => () => new C().init();
   register('MjReacher-v0', open(Reacher)); register('MjInvertedDoublePendulum-v0', open(InvertedDoublePendulum)); register('MjSwimmer-v0', open(Swimmer));
+  register('MjHalfCheetah-v0', open(HalfCheetah)); register('MjWalker2d-v0', open(Walker2d)); register('MjHumanoid-v0', open(Humanoid));
 }

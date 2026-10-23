@@ -11,6 +11,7 @@ const ADAPT = { // 學生看到的特徵 / 輸出維度 / 隱藏層
   // MuJoCo 環境（連續動作 ∈[-1,1]）
   'MjReacher-v0': { x: o => o, out: 2, cont: true, range: [-1, 1], hidden: [64, 64], opts: { episodes: 30, collectSteps: 50, epochs: 25, cap: 12000 } },
   'MjInvertedDoublePendulum-v0': { x: o => [o[0], Math.atan2(o[1], o[3]), Math.atan2(o[2], o[4]), o[5], o[6], o[7]], out: 1, cont: true, range: [-1, 1], hidden: [32, 32], opts: { episodes: 6, collectSteps: 400 } },
+  'MjHalfCheetah-v0': { x: o => o, out: 6, cont: true, range: [-1, 1], hidden: [64, 64], opts: { episodes: 3, collectSteps: 300 } },
   'MjSwimmer-v0': { x: o => o, out: 2, cont: true, range: [-1, 1], hidden: [32, 32], opts: { episodes: 3, collectSteps: 300 } },
 };
 export const imitable = id => id in ADAPT;
