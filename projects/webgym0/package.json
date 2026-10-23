@@ -1,0 +1,18 @@
+{
+  "name": "webgym0",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "純前端強化學習測試平台 (CartPole / FrozenLake / CliffWalking / MountainCar) + closed-form 策略",
+  "scripts": {
+    "test": "node test/run.mjs",
+    "start": "node serve.mjs",
+    "test:train": "node test/train.mjs",
+    "test:imitate": "node test/imitate.mjs",
+    "test:mujoco": "node test/mujoco.mjs"
+  },
+  "devDependencies": {
+    "@mujoco/mujoco": "^3.17.0",
+    "@tensorflow/tfjs": "^4.22.0"
+  }
+}
