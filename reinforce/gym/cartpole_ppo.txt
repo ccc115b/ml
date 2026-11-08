@@ -1,0 +1,6 @@
+(.venv) cccuser@cccimacdeiMac gym % python gym_ppo.py --env CartPole-v1 --play
+回合 1: reward 500.0, 存活 500 步
+回合 2: reward 500.0, 存活 500 步
+回合 3: reward 500.0, 存活 500 步
+回合 4: reward 500.0, 存活 500 步
+回合 5: reward 500.0, 存活 500 步
